@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 from instagrapi import Client
-from instagrapi.exceptions import ChallengeRequired, FeedbackRequired, PleaseWaitFewMinutes, LoginRequired
+from instagrapi.exceptions import LoginRequired, ChallengeRequired, FeedbackRequired, PleaseWaitFewMinutes, ClientError
 import threading
 import time
 import random
@@ -8,130 +8,116 @@ import os
 import gc
 
 app = Flask(__name__)
-app.secret_key = "sujal_hawk_spam_2026"
+app.secret_key = "sujal_hawk_nc_final_no_logout_2026"
 
-state = {"running": False, "sent": 0, "logs": [], "start_time": None, "current_acc_index": 0, "account_stats": []}
+state = {"running": False, "changed": 0, "logs": [], "start_time": None}
 cfg = {
-    "accounts": [],  # [{"sessionid": "...", "thread_id": 0, "proxy": "http://..." (optional)}]
-    "messages": [],
-    "spam_delay": 30,
-    "break_sec": 120,
-    "switch_after_msgs": 100
+    "accounts": [],  # [{"sessionid": "...", "thread_id": "...", "client": None}]
+    "names": [],
+    "nc_delay": 60,
 }
 
 DEVICES = [
-    {"phone_manufacturer": "Google", "phone_model": "Pixel 8 Pro", "android_version": 35, "android_release": "15", "app_version": "323.0.0.46.109"},
-    {"phone_manufacturer": "Samsung", "phone_model": "SM-S928B", "android_version": 35, "android_release": "15", "app_version": "324.0.0.41.110"},
-    {"phone_manufacturer": "OnePlus", "phone_model": "PJZ110", "android_version": 35, "android_release": "15", "app_version": "322.0.0.40.108"},
-    {"phone_manufacturer": "Xiaomi", "phone_model": "23127PN0CC", "android_version": 35, "android_release": "15", "app_version": "325.0.0.42.111"},
+    {"phone_manufacturer": "Google", "phone_model": "Pixel 9 Pro", "android_version": 35, "android_release": "15", "app_version": "330.0.0.45.112"},
+    {"phone_manufacturer": "Samsung", "phone_model": "SM-S938B", "android_version": 35, "android_release": "15", "app_version": "331.0.0.38.120"},
+    {"phone_manufacturer": "OnePlus", "phone_model": "CPH2653", "android_version": 35, "android_release": "15", "app_version": "329.0.0.55.99"},
+    {"phone_manufacturer": "Xiaomi", "phone_model": "24053PY3BC", "android_version": 35, "android_release": "15", "app_version": "332.0.0.29.110"},
 ]
 
-def log(msg):
+def log(msg, important=False):
     entry = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    if important:
+        entry = f"★★★ {entry} ★★★"
     state["logs"].append(entry)
+    print(entry)
     if len(state["logs"]) > 500:
         state["logs"] = state["logs"][-500:]
-    print(entry)  # Render logs
-
-def memory_guard():
     gc.collect()
-    log("MEMORY GUARD: Cleared unused objects")  # Ab yeh log show hoga
 
-def generate_variation(msg):
-    emojis = ['🔥', '💀', '😈', '🚀', '😂', '🤣', '😍', '❤️', '👍']
-    if random.random() > 0.5:
-        msg = msg + " " + random.choice(emojis) + random.choice(emojis)
-    return msg
+def initialize_clients():
+    log("Initializing clients – ONE TIME LOGIN ONLY")
+    for acc in cfg["accounts"]:
+        cl = Client()
+        cl.delay_range = [2, 8]
 
-def spam_message(cl, thread_id, msg):
-    try:
-        cl.direct_send(msg, thread_ids=[thread_id])
-        return True
-    except Exception as e:
-        log(f"SEND FAILED → {str(e)[:60]}")
-        return False
+        dev = random.choice(DEVICES)
+        cl.set_device(dev)
+        ua = f"Instagram {dev['app_version']} Android ({dev['android_version']}/{dev['android_release']}; 480dpi; 1080x2400; {dev['phone_manufacturer']}; {dev['phone_model']}; raven; raven; en_US)"
+        cl.set_user_agent(ua)
 
-def get_current_client():
-    index = state["current_acc_index"]
-    acc = cfg["accounts"][index]
-    cl = Client()
-    cl.delay_range = [8, 30]
-    device = random.choice(DEVICES)  # Har baar new device
-    cl.set_device(device)
-    cl.set_user_agent(f"Instagram {device['app_version']} Android ({device['android_version']}/{device['android_release']}; 480dpi; 1080x2340; {device['phone_manufacturer']}; {device['phone_model']}; raven; raven; en_US)")
+        log(f"LOGIN ATTEMPT for sessionid ending ...{acc['sessionid'][-6:]} → Device: {dev['phone_model']}")
 
-    if "proxy" in acc and acc["proxy"]:
-        cl.set_proxy(acc["proxy"])
-        log(f"Using proxy for acc #{index+1}: {acc['proxy']}")
+        try:
+            cl.login_by_sessionid(acc["sessionid"])
+            cl.get_timeline_feed()  # one-time csrf refresh
+            acc["client"] = cl
+            log(f"LOGIN SUCCESS – client ready for reuse", important=True)
+        except LoginRequired:
+            log(f"SESSION EXPIRED – this account skipped", important=True)
+        except ChallengeRequired:
+            log(f"CHALLENGE REQUIRED – this account skipped", important=True)
+        except Exception as e:
+            log(f"LOGIN ERROR → {str(e)[:100]} – this account skipped", important=True)
 
-    try:
-        cl.login_by_sessionid(acc["sessionid"])
-        log(f"LOGIN SUCCESS ACCOUNT #{index+1} (Device: {device['phone_model']})")
-        return cl
-    except LoginRequired:
-        log(f"ACCOUNT #{index+1} SESSION EXPIRED — SKIPPING")
-    except Exception as e:
-        log(f"ACCOUNT #{index+1} LOGIN FAILED → {str(e)[:80]} — SKIPPING")
-    return None
+def name_change(cl, thread_id, new_name):
+    for attempt in range(2):
+        try:
+            # Refresh csrf only if needed
+            if attempt > 0 or not cl.csrf_token:
+                cl.get_timeline_feed()
 
-def switch_account():
-    state["current_acc_index"] = (state["current_acc_index"] + 1) % len(cfg["accounts"])
-    log(f"SWITCHED TO ACCOUNT #{state['current_acc_index']+1}")
-    memory_guard()
+            payload = {"title": new_name.strip()}
+            response = cl.private_request(
+                f"direct_v2/threads/{thread_id}/update_title/",
+                data=payload,
+                headers=cl.get_headers(),
+                method="POST"
+            )
+            if response.get("status") == "ok":
+                log(f"NC SUCCESS → {new_name} (thread {thread_id})", important=True)
+                state["changed"] += 1
+                return True
+            else:
+                log(f"NC FAIL RESPONSE → {response.get('message', 'No message')}")
+        except FeedbackRequired:
+            log("FEEDBACK REQUIRED – Possible block", important=True)
+        except ClientError as e:
+            log(f"CLIENT ERROR → {str(e)}")
+        except Exception as e:
+            log(f"NC ERROR → {str(e)[:100]}")
 
-def combo_loop():
-    state["account_stats"] = [{"errors": 0, "sent": 0} for _ in cfg["accounts"]]
+        if attempt == 0:
+            log(f"Retrying NC in 10s...")
+            time.sleep(10)
 
-    current_cl = get_current_client()
-    if current_cl is None:
-        log("NO WORKING ACCOUNT — STOPPING")
+    return False
+
+def nc_loop():
+    initialize_clients()  # Login only once at startup
+
+    valid_accounts = [acc for acc in cfg["accounts"] if acc.get("client")]
+    if not valid_accounts or not cfg["names"]:
+        log("No valid accounts or names – stopping")
         state["running"] = False
         return
 
-    sent_count = 0
-    total_sent = 0
+    acc_index = 0
     while state["running"]:
-        try:
-            msg = random.choice(cfg["messages"])
-            msg = generate_variation(msg)
-            if spam_message(current_cl, cfg["accounts"][state["current_acc_index"]]["thread_id"], msg):
-                sent_count += 1
-                total_sent += 1
-                state["sent"] += 1
-                state["account_stats"][state["current_acc_index"]]["sent"] += 1
-                log(f"SENT #{state['sent']} → {msg[:40]} (Account #{state['current_acc_index']+1})")
+        acc = valid_accounts[acc_index]
+        cl = acc["client"]
 
-            if total_sent >= cfg["switch_after_msgs"]:
-                switch_account()
-                current_cl = get_current_client()
-                if current_cl is None:
-                    log("NO MORE WORKING ACCOUNTS — STOPPING")
-                    state["running"] = False
-                    break
-                total_sent = 0
+        name_idx = acc_index % len(cfg["names"])
+        new_name = cfg["names"][name_idx]
 
-            # Break if needed
-            if sent_count >= 50:  # Simple safety
-                log(f"BREAK {cfg['break_sec']} SEC")
-                time.sleep(cfg["break_sec"])
-                sent_count = 0
+        thread_id = acc["thread_id"]
+        name_change(cl, thread_id, new_name)
 
-            time.sleep(cfg["spam_delay"] + random.uniform(-2, 3))  # User set delay + small jitter
+        acc_index = (acc_index + 1) % len(valid_accounts)
+        log(f"Switching to next account #{acc_index+1}")
 
-        except (ChallengeRequired, FeedbackRequired):
-            log("Challenge/Feedback → skipping")
-            time.sleep(30)
-        except PleaseWaitFewMinutes:
-            log("Rate limit → waiting 8 min")
-            time.sleep(480)
-        except Exception as e:
-            log(f"ACTION FAILED → {str(e)[:60]}")
-            time.sleep(15)
-            switch_account()
-            current_cl = get_current_client()
-            if current_cl is None:
-                state["running"] = False
-                break
+        time.sleep(cfg["nc_delay"])
+
+    log("NC LOOP STOPPED")
 
 @app.route("/")
 def index():
@@ -139,28 +125,28 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start():
-    global state
+    global state, cfg
     state["running"] = False
     time.sleep(1)
-    state = {"running": True, "sent": 0, "logs": ["STARTED"], "start_time": time.time(), "current_acc_index": 0}
+
+    state = {"running": True, "changed": 0, "logs": ["STARTED"], "start_time": time.time()}
 
     accounts_raw = request.form["accounts"].strip().split("\n")
     cfg["accounts"] = []
     for line in accounts_raw:
-        if line.strip():
+        line = line.strip()
+        if line:
             parts = line.split(":")
-            sessionid = parts[0].strip()
-            thread_id = int(parts[1].strip())
-            proxy = parts[2].strip() if len(parts) > 2 else None
-            cfg["accounts"].append({"sessionid": sessionid, "thread_id": thread_id, "proxy": proxy})
+            if len(parts) >= 2:
+                sessionid = parts[0].strip()
+                thread_id = parts[1].strip()
+                cfg["accounts"].append({"sessionid": sessionid, "thread_id": thread_id, "client": None})
 
-    cfg["messages"] = [m.strip() for m in request.form["messages"].split("\n") if m.strip()]
-    cfg["spam_delay"] = float(request.form.get("spam_delay", "30"))
-    cfg["break_sec"] = int(request.form.get("break_sec", "120"))
-    cfg["switch_after_msgs"] = int(request.form.get("switch_after_msgs", "100"))
+    cfg["names"] = [n.strip() for n in request.form["names"].split("\n") if n.strip()]
+    cfg["nc_delay"] = float(request.form.get("nc_delay", "60"))
 
-    threading.Thread(target=combo_loop, daemon=True).start()
-    log(f"STARTED WITH {len(cfg['accounts'])} ACCOUNTS")
+    threading.Thread(target=nc_loop, daemon=True).start()
+    log(f"STARTED NC LOOP WITH {len(cfg['accounts'])} accounts | Delay: {cfg['nc_delay']}s")
 
     return jsonify({"ok": True})
 
@@ -180,10 +166,11 @@ def status():
         uptime = f"{h:02d}:{m:02d}:{s:02d}"
     return jsonify({
         "running": state["running"],
-        "sent": state["sent"],
+        "changed": state["changed"],
         "uptime": uptime,
         "logs": state["logs"][-100:]
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
